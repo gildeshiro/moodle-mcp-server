@@ -1,0 +1,26 @@
+# Smithery deploy manifest for moodle-mcp-server in MCP Streamable HTTP mode.
+# Deploy with: smithery deploy
+#
+# Required secrets (configure in Smithery dashboard):
+#   - MCP_AUTH_TOKEN  (shared bearer secret for claude.ai connector)
+#   - MOODLE_URL      (e.g. https://your.moodle.example)
+#   - MOODLE_TOKEN    (Moodle Web Service token; or use MOODLE_USERNAME + MOODLE_PASSWORD)
+
+name: moodle-mcp
+runtime: docker
+build:
+  dockerfile: Dockerfile
+start:
+  command: ["./moodle-mcp", "-mode", "http"]
+env:
+  required:
+    - MCP_AUTH_TOKEN
+    - MOODLE_URL
+  optional:
+    - MOODLE_TOKEN
+    - MOODLE_USERNAME
+    - MOODLE_PASSWORD
+    - MCP_CORS_ORIGINS
+healthcheck:
+  path: /healthz
+  port: 8080
