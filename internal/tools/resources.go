@@ -95,6 +95,114 @@ func HandleListResources(ctx context.Context, client *api.Client, input ListReso
 	return string(result), nil
 }
 
+// --- Read Resource Tool (returns content inline; useful for remote/HTTP mode) ---
+
+// MaxInlineFileBytes caps the size of files returned via HandleReadResource.
+// Anything larger should be retrieved with download_resource (stdio-mode) or
+// fetched outside the MCP path entirely. The base64 expansion of this limit
+// is ~13.3 MB on the wire, which most MCP clients comfortably handle.
+const MaxInlineFileBytes int64 = 10 * 1024 * 1024 // 10 MB
+
+type ReadResourceInput struct {
+	CourseID int `json:"course_id" jsonschema:"description=The Moodle course ID containing the resource"`
+	ModuleID int `json:"module_id" jsonschema:"description=The module ID of the resource to read (get from list_resources)"`
+}
+
+// ReadResourceOutput is the structured payload returned to the tool registration
+// layer; the registration converts it into an mcp.CallToolResult that embeds the
+// bytes as a base64 BlobResourceContents alongside a human-readable description.
+type ReadResourceOutput struct {
+	Description string // text shown to the model (filename, size, mime)
+	URI         string // canonical resource URI
+	Filename    string
+	MimeType    string
+	Size        int64
+	Bytes       []byte // raw file bytes; caller is responsible for base64-encoding
+}
+
+func HandleReadResource(ctx context.Context, client *api.Client, input ReadResourceInput) (*ReadResourceOutput, error) {
+	if !client.IsAuthenticated() {
+		return nil, api.ErrNotAuthenticated
+	}
+	if input.CourseID == 0 {
+		return nil, fmt.Errorf("course_id is required")
+	}
+	if input.ModuleID == 0 {
+		return nil, fmt.Errorf("module_id is required")
+	}
+
+	sections, err := getCourseContentsRaw(ctx, client, input.CourseID)
+	if err != nil {
+		return nil, err
+	}
+
+	var targetFile *FileContent
+	var moduleName string
+	for _, sec := range sections {
+		for _, mod := range sec.Modules {
+			if mod.ID == input.ModuleID {
+				moduleName = mod.Name
+				for _, f := range mod.Contents {
+					if f.Type == "file" {
+						fc := f
+						targetFile = &fc
+						break
+					}
+				}
+			}
+		}
+	}
+	if targetFile == nil {
+		return nil, fmt.Errorf("no downloadable file found for module_id %d in course %d", input.ModuleID, input.CourseID)
+	}
+	if targetFile.FileSize > MaxInlineFileBytes {
+		return nil, fmt.Errorf("file %q is %.1f MB, exceeds %d MB inline limit; use download_resource (local stdio mode) instead",
+			targetFile.Filename, float64(targetFile.FileSize)/1024/1024, MaxInlineFileBytes/(1024*1024))
+	}
+
+	downloadURL := targetFile.FileURL
+	if strings.Contains(downloadURL, "?") {
+		downloadURL += "&token=" + client.GetToken()
+	} else {
+		downloadURL += "?token=" + client.GetToken()
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	httpClient := &http.Client{Timeout: 120 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetching file: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch failed with status %d", resp.StatusCode)
+	}
+
+	// Cap the read so a server lying about Content-Length can't OOM us.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxInlineFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading body: %w", err)
+	}
+	if int64(len(body)) > MaxInlineFileBytes {
+		return nil, fmt.Errorf("file body exceeded %d MB inline limit during streaming", MaxInlineFileBytes/(1024*1024))
+	}
+
+	desc := fmt.Sprintf("Module %q file %q (%s, %.1f MB) returned inline as base64 blob.",
+		moduleName, targetFile.Filename, targetFile.MimeType, float64(len(body))/1024/1024)
+
+	return &ReadResourceOutput{
+		Description: desc,
+		URI:         fmt.Sprintf("moodle://course/%d/module/%d/%s", input.CourseID, input.ModuleID, targetFile.Filename),
+		Filename:    targetFile.Filename,
+		MimeType:    targetFile.MimeType,
+		Size:        int64(len(body)),
+		Bytes:       body,
+	}, nil
+}
+
 // --- Download Resource Tool ---
 
 type DownloadResourceInput struct {

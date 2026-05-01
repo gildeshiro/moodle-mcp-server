@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -372,10 +373,33 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 		},
 	)
 
+	// ── Read Resource (inline; preferred for remote/HTTP mode) ────
+	s.AddTool(
+		mcp.NewTool("read_resource",
+			mcp.WithDescription("Fetch a file (PDF, slides, etc.) from Moodle and return its content INLINE so the model can read it directly. Preferred for remote/HTTP deployments where the server has no access to the user's filesystem. Max 10 MB; use download_resource for larger files in stdio mode. Use list_resources to find module IDs."),
+			mcp.WithNumber("course_id", mcp.Required(), mcp.Description("The Moodle course ID")),
+			mcp.WithNumber("module_id", mcp.Required(), mcp.Description("The module ID of the resource (from list_resources)")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			out, err := tools.HandleReadResource(ctx, client, tools.ReadResourceInput{
+				CourseID: intArg(req, "course_id"),
+				ModuleID: intArg(req, "module_id"),
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultResource(out.Description, mcp.BlobResourceContents{
+				URI:      out.URI,
+				MIMEType: out.MimeType,
+				Blob:     base64.StdEncoding.EncodeToString(out.Bytes),
+			}), nil
+		},
+	)
+
 	// ── Download Resource ─────────────────────────────────────────
 	s.AddTool(
 		mcp.NewTool("download_resource",
-			mcp.WithDescription("Download a file (PDF, slides, etc.) from Moodle and save it locally. Use list_resources to find module IDs."),
+			mcp.WithDescription("Download a file (PDF, slides, etc.) from Moodle and save it on the SERVER's filesystem. Useful in local stdio mode (Claude Desktop) where save_dir is the user's machine. In remote/HTTP mode prefer `read_resource` instead — this tool's output is not visible to the model. Use list_resources to find module IDs."),
 			mcp.WithNumber("course_id", mcp.Required(), mcp.Description("The Moodle course ID")),
 			mcp.WithNumber("module_id", mcp.Required(), mcp.Description("The module ID of the resource (from list_resources)")),
 			mcp.WithString("save_dir", mcp.Description("Directory to save the file (default: ~/Downloads)")),
