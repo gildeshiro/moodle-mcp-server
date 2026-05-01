@@ -7,10 +7,15 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // GetTokenFromCredentials authenticates with Moodle and returns an API token.
 // It uses the moodle_mobile_app service which is universally available.
+//
+// Credentials are POSTed as form-urlencoded body — putting them in the URL
+// query string would expose them in server access logs, reverse-proxy logs,
+// and browser history.
 func GetTokenFromCredentials(ctx context.Context, baseURL, username, password string) (string, error) {
 	endpoint := fmt.Sprintf("%s/login/token.php", baseURL)
 
@@ -20,11 +25,11 @@ func GetTokenFromCredentials(ctx context.Context, baseURL, username, password st
 		"service":  {"moodle_mobile_app"},
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(params.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("creating auth request: %w", err)
 	}
-	req.URL.RawQuery = params.Encode()
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

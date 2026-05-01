@@ -19,7 +19,7 @@ type Config struct {
 // All fields are optional at load time — the login tool can provide them at runtime.
 func LoadFromEnv() *Config {
 	return &Config{
-		MoodleURL: normalizeURL(os.Getenv("MOODLE_URL")),
+		MoodleURL: NormalizeURL(os.Getenv("MOODLE_URL")),
 		Token:     os.Getenv("MOODLE_TOKEN"),
 		Username:  os.Getenv("MOODLE_USERNAME"),
 		Password:  os.Getenv("MOODLE_PASSWORD"),
@@ -52,7 +52,7 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-func normalizeURL(rawURL string) string {
+func NormalizeURL(rawURL string) string {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return ""
