@@ -12,6 +12,7 @@ import (
 
 	"github.com/jawadh/moodle-mcp-server/internal/api"
 	"github.com/jawadh/moodle-mcp-server/internal/config"
+	"github.com/jawadh/moodle-mcp-server/internal/oauth"
 	"github.com/jawadh/moodle-mcp-server/internal/server"
 	"github.com/jawadh/moodle-mcp-server/internal/tools"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -25,6 +26,8 @@ func main() {
 	authToken := flag.String("auth-token", "", "Bearer token for http mode (env: MCP_AUTH_TOKEN)")
 	corsOrigins := flag.String("cors-origins", "", "Comma-separated CORS origins for http mode (env: MCP_CORS_ORIGINS)")
 	httpPath := flag.String("http-path", "/mcp", "MCP endpoint path for http mode (env: MCP_HTTP_PATH)")
+	useOAuth := flag.Bool("oauth", false, "Enable OAuth 2.1 + DCR for http mode (env: MCP_USE_OAUTH)")
+	oauthIssuer := flag.String("oauth-issuer", "", "Public base URL of the deployment, required when -oauth (env: MCP_OAUTH_ISSUER)")
 	flag.Parse()
 
 	// Load config from environment
@@ -49,6 +52,12 @@ func main() {
 	}
 	if v := os.Getenv("MCP_HTTP_PATH"); v != "" {
 		*httpPath = v
+	}
+	if os.Getenv("MCP_USE_OAUTH") == "1" {
+		*useOAuth = true
+	}
+	if v := os.Getenv("MCP_OAUTH_ISSUER"); v != "" {
+		*oauthIssuer = v
 	}
 	// Honor PORT env from cloud platforms (Railway, Render, Fly, Cloud Run)
 	if envPort := os.Getenv("PORT"); envPort != "" {
@@ -92,7 +101,7 @@ func main() {
 	case "rest":
 		runRESTServer(client, *restPort)
 	case "http":
-		runStreamableHTTPServer(client, *restPort, *authToken, *corsOrigins, *httpPath)
+		runStreamableHTTPServer(client, *restPort, *authToken, *corsOrigins, *httpPath, *useOAuth, *oauthIssuer)
 	case "both":
 		log.Println("Running both MCP and REST servers (experimental)")
 		go runRESTServer(client, *restPort)
@@ -132,7 +141,7 @@ func runRESTServer(client *api.Client, port int) {
 	}
 }
 
-func runStreamableHTTPServer(client *api.Client, port int, authToken, corsOrigins, path string) {
+func runStreamableHTTPServer(client *api.Client, port int, authToken, corsOrigins, path string, useOAuth bool, issuer string) {
 	s := mcpserver.NewMCPServer(
 		"moodle-mcp-server",
 		"1.2.0",
@@ -140,14 +149,29 @@ func runStreamableHTTPServer(client *api.Client, port int, authToken, corsOrigin
 	)
 	registerTools(s, client)
 
-	if err := server.RunStreamable(context.Background(), s, server.StreamableOpts{
+	opts := server.StreamableOpts{
 		Port:        port,
-		AuthToken:   authToken,
-		AllowNoAuth: os.Getenv("MCP_DISABLE_AUTH") == "1",
 		CORSOrigins: corsOrigins,
 		Path:        path,
 		Version:     "1.2.0",
-	}); err != nil {
+	}
+	switch {
+	case useOAuth:
+		// OAuth 2.1 + DCR mode: the provider becomes the bearer issuer; the
+		// boot guard in RunStreamable will reject if AuthToken/AllowNoAuth is
+		// also set, so we deliberately leave them empty here.
+		if issuer == "" {
+			fmt.Fprintln(os.Stderr, "MCP_OAUTH_ISSUER is required when MCP_USE_OAUTH=1 (the public base URL of this deployment, e.g. https://moodle-mcp.example.com)")
+			os.Exit(1)
+		}
+		opts.OAuthProvider = oauth.NewProvider(issuer)
+	default:
+		// Existing modes: bearer-static or URL-as-secret. Mutually exclusive
+		// with OAuth, enforced by the boot guard in RunStreamable.
+		opts.AuthToken = authToken
+		opts.AllowNoAuth = os.Getenv("MCP_DISABLE_AUTH") == "1"
+	}
+	if err := server.RunStreamable(context.Background(), s, opts); err != nil {
 		fmt.Fprintf(os.Stderr, "streamable server error: %v\n", err)
 		os.Exit(1)
 	}
