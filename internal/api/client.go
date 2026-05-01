@@ -132,10 +132,13 @@ func (c *Client) Call(ctx context.Context, function string, params map[string]st
 	return json.RawMessage(body), nil
 }
 
-// UploadFile uploads a file to Moodle's draft area via the non-JSON
-// /webservice/upload.php endpoint and returns the draft itemid that can
-// later be referenced from JSON-RPC calls (e.g. mod_assign_save_submission).
-func (c *Client) UploadFile(ctx context.Context, content []byte, filename string) (int, error) {
+// UploadFile uploads a single file to Moodle's draft area via the non-JSON
+// /webservice/upload.php endpoint and returns the draft itemid that can later
+// be referenced from JSON-RPC calls (e.g. mod_assign_save_submission). Pass
+// itemid=0 to create a fresh draft area (Moodle assigns a new itemid in the
+// response). For multi-file submissions, pass the itemid returned by the
+// first call to bundle subsequent files into the same draft area.
+func (c *Client) UploadFile(ctx context.Context, content []byte, filename string, itemID int) (int, error) {
 	c.mu.RLock()
 	baseURL := c.baseURL
 	token := c.token
@@ -152,7 +155,7 @@ func (c *Client) UploadFile(ctx context.Context, content []byte, filename string
 	for key, val := range map[string]string{
 		"token":    token,
 		"filearea": "draft",
-		"itemid":   "0",
+		"itemid":   fmt.Sprintf("%d", itemID),
 		"filepath": "/",
 		"filename": filename,
 	} {

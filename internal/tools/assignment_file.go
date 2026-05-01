@@ -48,8 +48,8 @@ func HandleSubmitAssignmentFile(ctx context.Context, client *api.Client, input S
 		return "", fmt.Errorf("decoded file content is empty")
 	}
 
-	// Step 1: upload file to draft area.
-	itemID, err := client.UploadFile(ctx, content, input.Filename)
+	// Step 1: upload file to draft area (itemid=0 → Moodle allocates a fresh draft).
+	itemID, err := client.UploadFile(ctx, content, input.Filename, 0)
 	if err != nil {
 		return "", fmt.Errorf("uploading file to Moodle draft area: %w", err)
 	}

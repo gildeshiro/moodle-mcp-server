@@ -2,8 +2,10 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jawadh/moodle-mcp-server/internal/api"
@@ -274,10 +276,30 @@ func HandleGetForumDiscussion(ctx context.Context, client *api.Client, input Get
 
 // --- Post Forum Reply Tool ---
 
+// ForumAttachment is a single file accompanying a forum post. Contents are
+// base64-encoded; data: URI prefixes and embedded whitespace are tolerated
+// (matches the relaxed parsing in submit_assignment_file).
+type ForumAttachment struct {
+	Filename      string `json:"filename" jsonschema:"description=The filename to attach (e.g. report.pdf)"`
+	ContentBase64 string `json:"content_base64" jsonschema:"description=File content encoded as standard base64; data: URI prefix is also accepted"`
+}
+
 type PostForumReplyInput struct {
-	PostID  int    `json:"post_id" jsonschema:"description=The Moodle PARENT post ID to reply to (not the discussion ID — the post you are replying under)"`
-	Subject string `json:"subject" jsonschema:"description=The subject line of the reply"`
-	Message string `json:"message" jsonschema:"description=The message body (HTML supported)"`
+	PostID      int               `json:"post_id" jsonschema:"description=The Moodle PARENT post ID to reply to (not the discussion ID — the post you are replying under)"`
+	Subject     string            `json:"subject" jsonschema:"description=The subject line of the reply"`
+	Message     string            `json:"message" jsonschema:"description=The message body (HTML supported)"`
+	Attachments []ForumAttachment `json:"attachments,omitempty" jsonschema:"description=Optional files to attach to the reply. Each item is {filename, content_base64}. All files share a single draft itemid (Moodle's standard pattern)."`
+}
+
+// decodeBase64Content tolerates a data: URI prefix and embedded whitespace —
+// some clients line-wrap base64 or hand back data URIs verbatim. Mirrors the
+// permissive decode used by submit_assignment_file.
+func decodeBase64Content(payload string) ([]byte, error) {
+	if idx := strings.Index(payload, ";base64,"); idx >= 0 {
+		payload = payload[idx+len(";base64,"):]
+	}
+	payload = strings.NewReplacer("\n", "", "\r", "", " ", "", "\t", "").Replace(payload)
+	return base64.StdEncoding.DecodeString(payload)
 }
 
 func HandlePostForumReply(ctx context.Context, client *api.Client, input PostForumReplyInput) (string, error) {
@@ -300,6 +322,44 @@ func HandlePostForumReply(ctx context.Context, client *api.Client, input PostFor
 		"message":       input.Message,
 		"messageformat": "1",
 	}
+
+	// Optional file attachments. Moodle's standard multi-file pattern: upload
+	// the FIRST file with itemid=0 to allocate a fresh draft area, then upload
+	// each subsequent file with the itemid returned by the first call so they
+	// land in the same draft. Pass that itemid to mod_forum_add_discussion_post
+	// via options[0][name]=attachmentsid&options[0][value]=<draftId>.
+	var draftItemID int
+	uploadedNames := make([]string, 0, len(input.Attachments))
+	for i, att := range input.Attachments {
+		if att.Filename == "" {
+			return "", fmt.Errorf("attachments[%d].filename is required", i)
+		}
+		if att.ContentBase64 == "" {
+			return "", fmt.Errorf("attachments[%d].content_base64 is required", i)
+		}
+		content, err := decodeBase64Content(att.ContentBase64)
+		if err != nil {
+			return "", fmt.Errorf("attachments[%d]: decoding base64: %w", i, err)
+		}
+		if len(content) == 0 {
+			return "", fmt.Errorf("attachments[%d]: decoded content is empty", i)
+		}
+		got, err := client.UploadFile(ctx, content, att.Filename, draftItemID)
+		if err != nil {
+			return "", fmt.Errorf("attachments[%d] (%s): upload failed: %w", i, att.Filename, err)
+		}
+		// First upload returns the draft itemid Moodle allocated; reuse it for
+		// the rest so all attachments end up in the same draft area.
+		if draftItemID == 0 {
+			draftItemID = got
+		}
+		uploadedNames = append(uploadedNames, att.Filename)
+	}
+	if draftItemID != 0 {
+		params["options[0][name]"] = "attachmentsid"
+		params["options[0][value]"] = fmt.Sprintf("%d", draftItemID)
+	}
+
 	data, err := client.Call(ctx, "mod_forum_add_discussion_post", params)
 	if err != nil {
 		return "", fmt.Errorf("posting reply: %w", err)
@@ -311,12 +371,18 @@ func HandlePostForumReply(ctx context.Context, client *api.Client, input PostFor
 	}
 	_ = json.Unmarshal(data, &resp)
 
-	out, _ := json.MarshalIndent(map[string]any{
-		"success":         true,
-		"new_post_id":     resp.PostID,
-		"parent_post_id":  input.PostID,
-		"subject":         input.Subject,
-		"warnings":        resp.Warnings,
-	}, "", "  ")
+	result := map[string]any{
+		"success":        true,
+		"new_post_id":    resp.PostID,
+		"parent_post_id": input.PostID,
+		"subject":        input.Subject,
+		"warnings":       resp.Warnings,
+	}
+	if draftItemID != 0 {
+		result["attachments_uploaded"] = uploadedNames
+		result["attachments_draft_itemid"] = draftItemID
+	}
+
+	out, _ := json.MarshalIndent(result, "", "  ")
 	return string(out), nil
 }
