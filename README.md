@@ -46,7 +46,7 @@ Students can interact with their Moodle account through their favorite AI — vi
 | `list_forums` | List forums in a course |
 | `list_forum_discussions` | List discussions in a forum |
 | `get_forum_discussion` | Read posts in a discussion |
-| `post_forum_reply` | Reply to a discussion (HTML supported) |
+| `post_forum_reply` | Reply to a discussion (HTML supported; optional file attachments via `attachments: [{filename, content_base64}]`) |
 | `list_messages` | Inbox messages (filter by unread, with limit) |
 | `send_message` | Send a direct message to another user |
 
@@ -55,6 +55,10 @@ Students can interact with their Moodle account through their favorite AI — vi
 |------|-------------|
 | `list_quizzes` | Quizzes in a course with open/close dates and grade info |
 | `get_quiz_attempts` | Your past attempts and grades for a quiz |
+| `start_quiz_attempt` | Begin a new attempt on a quiz (returns `attempt_id` + layout) |
+| `get_quiz_question` | Read questions on a page of an in-progress attempt; extracts opaque `answer_field_names` for the model to echo back |
+| `save_quiz_answers` | Save answers for a page (without finalizing). `answers` is a map keyed by `answer_field_names` |
+| `submit_quiz_attempt` | Submit the current page (`finalize=false`) or finalize the whole attempt (`finalize=true`). Supports multichoice (single/multi), truefalse, shortanswer, numerical, essay-text. Drag-drop / hot-spot / gap-select / matching are NOT covered. |
 | `list_lessons` | Lessons in a course |
 | `get_lesson_page` | Read a lesson page's content (auto-picks entry page) |
 
