@@ -552,6 +552,211 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 			return mcp.NewToolResultText(result), nil
 		},
 	)
+
+	// ── Submit Assignment File ───────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("submit_assignment_file",
+			mcp.WithDescription("Submit a file (PDF, .docx, image, etc.) to a Moodle assignment that requires file upload. Two-step flow: uploads to Moodle's draft area then finalizes the submission. Pass file content as standard base64 in content_base64; data: URI prefix is also accepted."),
+			mcp.WithNumber("assignment_id", mcp.Required(), mcp.Description("The Moodle assignment ID to submit to")),
+			mcp.WithString("filename", mcp.Required(), mcp.Description("The filename to attach (e.g. essay.pdf)")),
+			mcp.WithString("content_base64", mcp.Required(), mcp.Description("File content encoded as base64")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := intArg(req, "assignment_id")
+			filename := mcp.ParseString(req, "filename", "")
+			content := mcp.ParseString(req, "content_base64", "")
+			result, err := tools.HandleSubmitAssignmentFile(ctx, client, tools.SubmitAssignmentFileInput{
+				AssignmentID: id, Filename: filename, ContentBase64: content,
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── List Forums ──────────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("list_forums",
+			mcp.WithDescription("List all Moodle forums (announcements, discussion forums) in a course."),
+			mcp.WithNumber("course_id", mcp.Required(), mcp.Description("The Moodle course ID")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := intArg(req, "course_id")
+			result, err := tools.HandleListForums(ctx, client, tools.ListForumsInput{CourseID: id})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── List Forum Discussions ───────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("list_forum_discussions",
+			mcp.WithDescription("List discussions in a Moodle forum, sorted by most recent activity."),
+			mcp.WithNumber("forum_id", mcp.Required(), mcp.Description("The Moodle forum ID (from list_forums)")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := intArg(req, "forum_id")
+			result, err := tools.HandleListForumDiscussions(ctx, client, tools.ListForumDiscussionsInput{ForumID: id})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── Get Forum Discussion ─────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("get_forum_discussion",
+			mcp.WithDescription("Get the full thread of posts in a Moodle forum discussion (root post + all replies)."),
+			mcp.WithNumber("discussion_id", mcp.Required(), mcp.Description("The Moodle discussion ID (from list_forum_discussions)")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := intArg(req, "discussion_id")
+			result, err := tools.HandleGetForumDiscussion(ctx, client, tools.GetForumDiscussionInput{DiscussionID: id})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── Post Forum Reply ─────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("post_forum_reply",
+			mcp.WithDescription("Post a reply to a Moodle forum post. post_id is the PARENT post id (use get_forum_discussion to find it). HTML formatting is supported in the message body."),
+			mcp.WithNumber("post_id", mcp.Required(), mcp.Description("The PARENT post ID to reply under (from get_forum_discussion)")),
+			mcp.WithString("subject", mcp.Required(), mcp.Description("Subject line of the reply")),
+			mcp.WithString("message", mcp.Required(), mcp.Description("The message body (HTML supported)")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			postID := intArg(req, "post_id")
+			subject := mcp.ParseString(req, "subject", "")
+			message := mcp.ParseString(req, "message", "")
+			result, err := tools.HandlePostForumReply(ctx, client, tools.PostForumReplyInput{
+				PostID: postID, Subject: subject, Message: message,
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── List Messages ────────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("list_messages",
+			mcp.WithDescription("List Moodle direct messages received by the logged-in user (separate from notifications). Defaults to unread_only=true."),
+			mcp.WithBoolean("unread_only", mcp.Description("Only show unread messages (default: true)")),
+			mcp.WithNumber("limit", mcp.Description("Maximum number of messages (default: 20)")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			limit := intArg(req, "limit")
+			unreadOnly := true
+			if v, ok := req.GetArguments()["unread_only"]; ok {
+				if b, ok := v.(bool); ok {
+					unreadOnly = b
+				}
+			}
+			result, err := tools.HandleListMessages(ctx, client, tools.ListMessagesInput{
+				UnreadOnly: unreadOnly, Limit: limit,
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── Send Message ─────────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("send_message",
+			mcp.WithDescription("Send a Moodle direct message to another user. Requires the recipient's Moodle user ID."),
+			mcp.WithNumber("to_user_id", mcp.Required(), mcp.Description("The recipient's Moodle user ID")),
+			mcp.WithString("message", mcp.Required(), mcp.Description("The message text to send (HTML supported)")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			toID := intArg(req, "to_user_id")
+			message := mcp.ParseString(req, "message", "")
+			result, err := tools.HandleSendMessage(ctx, client, tools.SendMessageInput{
+				ToUserID: toID, Message: message,
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── List Quizzes ─────────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("list_quizzes",
+			mcp.WithDescription("List Moodle quizzes in a course with open/close dates and attempt limits."),
+			mcp.WithNumber("course_id", mcp.Required(), mcp.Description("The Moodle course ID")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := intArg(req, "course_id")
+			result, err := tools.HandleListQuizzes(ctx, client, tools.ListQuizzesInput{CourseID: id})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── Get Quiz Attempts ────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("get_quiz_attempts",
+			mcp.WithDescription("Get the logged-in user's attempt history for a Moodle quiz (state, start/finish times, sum of grades)."),
+			mcp.WithNumber("quiz_id", mcp.Required(), mcp.Description("The Moodle quiz ID (from list_quizzes)")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := intArg(req, "quiz_id")
+			result, err := tools.HandleGetQuizAttempts(ctx, client, tools.GetQuizAttemptsInput{QuizID: id})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── List Lessons ─────────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("list_lessons",
+			mcp.WithDescription("List Moodle lessons in a course with availability and deadline dates."),
+			mcp.WithNumber("course_id", mcp.Required(), mcp.Description("The Moodle course ID")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := intArg(req, "course_id")
+			result, err := tools.HandleListLessons(ctx, client, tools.ListLessonsInput{CourseID: id})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── Get Lesson Page ──────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("get_lesson_page",
+			mcp.WithDescription("Get a Moodle lesson page's HTML contents and navigation links. Pass page_id=0 (or omit) to fetch the entry page."),
+			mcp.WithNumber("lesson_id", mcp.Required(), mcp.Description("The Moodle lesson ID (from list_lessons)")),
+			mcp.WithNumber("page_id", mcp.Description("The lesson page ID (omit or pass 0 to fetch the first page)")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			lessonID := intArg(req, "lesson_id")
+			pageID := intArg(req, "page_id")
+			result, err := tools.HandleGetLessonPage(ctx, client, tools.GetLessonPageInput{
+				LessonID: lessonID, PageID: pageID,
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
 }
 
 // intArg extracts an integer from request arguments (JSON numbers are float64).
