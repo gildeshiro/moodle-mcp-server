@@ -19,7 +19,8 @@ import (
 // StreamableOpts configures the remote HTTP MCP server.
 type StreamableOpts struct {
 	Port        int
-	AuthToken   string // required (non-empty); enforced by RunStreamable
+	AuthToken   string // required (non-empty); enforced by RunStreamable unless AllowNoAuth
+	AllowNoAuth bool   // skip the bearer auth middleware entirely (URL-as-secret model)
 	CORSOrigins string // comma-separated; empty = no CORS
 	Path        string // default "/mcp"
 	Version     string // surfaced in /healthz
@@ -34,8 +35,8 @@ const shutdownTimeout = 10 * time.Second
 // fails. On shutdown signal, drains in-flight requests for up to 10 seconds
 // before returning.
 func RunStreamable(ctx context.Context, mcp *mcpserver.MCPServer, opts StreamableOpts) error {
-	if opts.AuthToken == "" {
-		return errors.New("MCP_AUTH_TOKEN required for http mode (security guardrail)")
+	if opts.AuthToken == "" && !opts.AllowNoAuth {
+		return errors.New("MCP_AUTH_TOKEN required for http mode (security guardrail; set MCP_DISABLE_AUTH=1 to opt out — URL becomes the only secret)")
 	}
 	if opts.Path == "" {
 		opts.Path = "/mcp"
@@ -56,7 +57,16 @@ func RunStreamable(ctx context.Context, mcp *mcpserver.MCPServer, opts Streamabl
 		origins = strings.Split(opts.CORSOrigins, ",")
 	}
 
-	auth := BearerAuth(opts.AuthToken)
+	// Auth chain. When AllowNoAuth is set (typically because the client doesn't
+	// support custom headers — e.g. claude.ai web BETA only offers OAuth), the
+	// bearer middleware is replaced with a no-op pass-through. The deployment
+	// URL becomes the only secret. Loud warning at startup so operators notice.
+	auth := func(h http.Handler) http.Handler { return h }
+	if !opts.AllowNoAuth {
+		auth = BearerAuth(opts.AuthToken)
+	} else {
+		log.Println("WARNING: MCP_DISABLE_AUTH=1 — bearer auth is OFF. The deployment URL is the only protection. Rotate the URL if leaked.")
+	}
 	cors := CORS(origins)
 	logger := RequestLogger()
 

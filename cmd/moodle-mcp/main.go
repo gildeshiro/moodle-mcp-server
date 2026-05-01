@@ -142,6 +142,7 @@ func runStreamableHTTPServer(client *api.Client, port int, authToken, corsOrigin
 	if err := server.RunStreamable(context.Background(), s, server.StreamableOpts{
 		Port:        port,
 		AuthToken:   authToken,
+		AllowNoAuth: os.Getenv("MCP_DISABLE_AUTH") == "1",
 		CORSOrigins: corsOrigins,
 		Path:        path,
 		Version:     "1.2.0",
