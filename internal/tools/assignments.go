@@ -309,10 +309,3 @@ func HandleSubmitJournal(ctx context.Context, client *api.Client, input SubmitJo
 	return fmt.Sprintf("Journal %d entry saved successfully at %s",
 		input.JournalID, time.Now().Format("2006-01-02 15:04:05")), nil
 }
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
-}

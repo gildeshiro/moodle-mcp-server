@@ -97,23 +97,3 @@ func HandleGetNotifications(ctx context.Context, client *api.Client, input GetNo
 	}, "", "  ")
 	return string(result), nil
 }
-
-// stripHTML removes HTML tags from a string (simple implementation).
-func stripHTML(s string) string {
-	var result []byte
-	inTag := false
-	for i := 0; i < len(s); i++ {
-		if s[i] == '<' {
-			inTag = true
-			continue
-		}
-		if s[i] == '>' {
-			inTag = false
-			continue
-		}
-		if !inTag {
-			result = append(result, s[i])
-		}
-	}
-	return string(result)
-}

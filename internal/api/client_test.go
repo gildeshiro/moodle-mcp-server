@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Jawadh-Salih/moodle-mcp-server/internal/api"
+	"github.com/jawadh/moodle-mcp-server/internal/api"
 )
 
 func TestClientIsAuthenticated(t *testing.T) {

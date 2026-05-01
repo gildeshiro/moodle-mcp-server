@@ -3,7 +3,7 @@ package config_test
 import (
 	"testing"
 
-	"github.com/Jawadh-Salih/moodle-mcp-server/internal/config"
+	"github.com/jawadh/moodle-mcp-server/internal/config"
 )
 
 func TestNormalizeURL(t *testing.T) {
