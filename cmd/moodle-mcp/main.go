@@ -19,8 +19,11 @@ import (
 
 func main() {
 	// Parse command line flags
-	mode := flag.String("mode", "mcp", "Server mode: 'mcp' for Claude, 'rest' for HTTP API, 'both' for both")
+	mode := flag.String("mode", "mcp", "Server mode: 'mcp' (stdio), 'rest' (custom HTTP API), 'http' (MCP Streamable HTTP), 'both' (mcp+rest)")
 	restPort := flag.Int("port", 8080, "REST API port (default: 8080)")
+	authToken := flag.String("auth-token", "", "Bearer token for http mode (env: MCP_AUTH_TOKEN)")
+	corsOrigins := flag.String("cors-origins", "", "Comma-separated CORS origins for http mode (env: MCP_CORS_ORIGINS)")
+	httpPath := flag.String("http-path", "/mcp", "MCP endpoint path for http mode (env: MCP_HTTP_PATH)")
 	flag.Parse()
 
 	// Load config from environment
@@ -32,6 +35,22 @@ func main() {
 
 	// Allow port override via env var
 	if envPort := os.Getenv("REST_API_PORT"); envPort != "" {
+		if p, err := strconv.Atoi(envPort); err == nil {
+			*restPort = p
+		}
+	}
+
+	if *authToken == "" {
+		*authToken = os.Getenv("MCP_AUTH_TOKEN")
+	}
+	if *corsOrigins == "" {
+		*corsOrigins = os.Getenv("MCP_CORS_ORIGINS")
+	}
+	if v := os.Getenv("MCP_HTTP_PATH"); v != "" {
+		*httpPath = v
+	}
+	// Honor PORT env from cloud platforms (Railway, Render, Fly, Cloud Run)
+	if envPort := os.Getenv("PORT"); envPort != "" {
 		if p, err := strconv.Atoi(envPort); err == nil {
 			*restPort = p
 		}
@@ -71,6 +90,8 @@ func main() {
 		runMCPServer(client)
 	case "rest":
 		runRESTServer(client, *restPort)
+	case "http":
+		runStreamableHTTPServer(client, *restPort, *authToken, *corsOrigins, *httpPath)
 	case "both":
 		log.Println("Running both MCP and REST servers (experimental)")
 		go runRESTServer(client, *restPort)
@@ -110,12 +131,32 @@ func runRESTServer(client *api.Client, port int) {
 	}
 }
 
+func runStreamableHTTPServer(client *api.Client, port int, authToken, corsOrigins, path string) {
+	s := mcpserver.NewMCPServer(
+		"moodle-mcp-server",
+		"1.2.0",
+		mcpserver.WithToolCapabilities(true),
+	)
+	registerTools(s, client)
+
+	if err := server.RunStreamable(context.Background(), s, server.StreamableOpts{
+		Port:        port,
+		AuthToken:   authToken,
+		CORSOrigins: corsOrigins,
+		Path:        path,
+		Version:     "1.2.0",
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "streamable server error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 
 	// ── Login ──────────────────────────────────────────────────────
 	s.AddTool(
 		mcp.NewTool("login",
-			mcp.WithDescription("Log in to your Moodle account. This is the first step — provide your Moodle site URL, username, and password."),
+			mcp.WithDescription("Log in to your Moodle account. This is the first step — provide your Moodle site URL, username, and password. (In remote HTTP mode, prefer pre-configuring MOODLE_TOKEN server-side so credentials don't transit the network.)"),
 			mcp.WithString("moodle_url", mcp.Required(), mcp.Description("Your Moodle site URL (e.g. https://online.uom.lk)")),
 			mcp.WithString("username", mcp.Required(), mcp.Description("Your Moodle username or email")),
 			mcp.WithString("password", mcp.Required(), mcp.Description("Your Moodle password")),
