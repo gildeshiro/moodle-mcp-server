@@ -87,6 +87,41 @@ go mod tidy
 go build -o moodle-mcp ./cmd/moodle-mcp/
 ```
 
+## Remote (HTTP) mode — for claude.ai custom connectors
+
+The server can also run as a remote MCP endpoint over Streamable HTTP, suitable for [claude.ai custom connectors](https://support.claude.com/en/articles/11503834) and any other client that speaks the MCP Streamable HTTP transport.
+
+### Quick start (local)
+
+```bash
+# Generate a strong shared secret
+export MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+
+# Configure your Moodle session (one of the two options below)
+export MOODLE_URL=https://your.moodle.example
+export MOODLE_TOKEN=<your-moodle-mobile-token>
+# or use username/password (server fetches a token at boot):
+# export MOODLE_USERNAME=you; export MOODLE_PASSWORD=...
+
+./moodle-mcp -mode http -port 8080
+```
+
+Then in **claude.ai → Settings → Connectors → Add custom connector**:
+
+- **URL:** `https://<your-deployment>/mcp`
+- **Custom header:** `Authorization: Bearer <your MCP_AUTH_TOKEN>`
+
+### Available knobs
+
+| Flag | Env var | Default | Purpose |
+|---|---|---|---|
+| `-auth-token` | `MCP_AUTH_TOKEN` | — (required) | Shared bearer secret |
+| `-port` | `PORT`, `REST_API_PORT` | `8080` | TCP port to listen on. Note: env vars override the flag (cloud platforms like Railway/Render/Fly inject `PORT`). |
+| `-cors-origins` | `MCP_CORS_ORIGINS` | (empty) | Comma-separated origins (e.g. `https://claude.ai,https://claude.com`) |
+| `-http-path` | `MCP_HTTP_PATH` | `/mcp` | Endpoint path |
+
+The server refuses to boot in `http` mode without an auth token (security guardrail). The `/healthz` endpoint is unauthenticated for cloud load balancers. See [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md#claudeai-custom-connector) for hosted deployment recipes.
+
 ## Usage
 
 ### Option 1: Interactive Login (Recommended)

@@ -331,3 +331,119 @@ curl https://YOUR_DEPLOYED_URL/health
    ```
 4. Update your ChatGPT/Gemini OpenAPI spec with the deployed URL
 5. Share with your friends!
+
+---
+
+## claude.ai Custom Connector
+
+Use `-mode http` to serve [claude.ai custom connectors](https://support.claude.com/en/articles/11503834) and other Streamable HTTP clients. Below: four free-tier-friendly hosting recipes.
+
+### Common prerequisites
+
+```bash
+# Generate a shared secret you'll paste into claude.ai
+export MCP_AUTH_TOKEN=$(openssl rand -hex 32)
+
+# Pick one auth path:
+# (a) Pre-issued Moodle token (recommended for production):
+export MOODLE_URL=https://your.moodle.example
+export MOODLE_TOKEN=...
+# (b) Username + password (server fetches a token at boot):
+# export MOODLE_URL=...; export MOODLE_USERNAME=...; export MOODLE_PASSWORD=...
+```
+
+In claude.ai → Settings → Connectors → Add custom connector:
+- **URL:** `https://<your-host>/mcp`
+- **Custom header:** `Authorization: Bearer <MCP_AUTH_TOKEN>`
+
+---
+
+### Option 1: Railway (recommended — no cold start, free tier)
+
+```bash
+# 1. Install Railway CLI
+npm i -g @railway/cli
+railway login
+
+# 2. From the repo root:
+railway init
+railway up
+
+# 3. Set env vars in the Railway dashboard:
+#    MCP_AUTH_TOKEN, MOODLE_URL, MOODLE_TOKEN
+# 4. Set the "Start Command" override to:
+#    ./moodle-mcp -mode http
+#    (or use examples/deploy/railway.json — Railway picks it up automatically)
+```
+
+Railway's $5/month free credit comfortably covers a single-user MCP endpoint.
+
+### Option 2: Smithery (MCP-specific registry)
+
+```bash
+# 1. Install Smithery CLI
+npm i -g @smithery/cli
+
+# 2. From repo root (smithery.yaml is in examples/deploy/):
+cp examples/deploy/smithery.yaml .
+
+# 3. Deploy
+smithery deploy
+
+# 4. Configure secrets in the Smithery dashboard:
+#    MCP_AUTH_TOKEN, MOODLE_URL, MOODLE_TOKEN
+```
+
+### Option 3: Google Cloud Run (scale-to-zero, generous free tier)
+
+```bash
+gcloud run deploy moodle-mcp \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --port 8080 \
+  --command "./moodle-mcp" \
+  --args "-mode,http" \
+  --set-env-vars "MCP_AUTH_TOKEN=...,MOODLE_URL=...,MOODLE_TOKEN=..."
+```
+
+`--allow-unauthenticated` exposes the URL publicly — the bearer middleware enforces access. Cloud Run scales to zero between requests; the first call after idle takes ~1-2 s to cold-start.
+
+### Option 4: Fly.io
+
+```bash
+flyctl launch --no-deploy
+# In the generated fly.toml, override the Dockerfile CMD to switch to http mode.
+# The Dockerfile uses ENTRYPOINT ["./moodle-mcp"], so [processes] entries are
+# args appended to that entrypoint:
+#   [processes]
+#   app = "-mode http"
+#   [env]
+#   PORT = "8080"
+flyctl secrets set MCP_AUTH_TOKEN=... MOODLE_URL=... MOODLE_TOKEN=...
+flyctl deploy
+```
+
+---
+
+### Verifying the deployment
+
+```bash
+# Health check (no auth required):
+curl https://<your-host>/healthz
+# → {"status":"ok","version":"1.2.0","mode":"http"}
+
+# Auth gate:
+curl -X POST https://<your-host>/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+# → 401 Unauthorized
+
+curl -X POST https://<your-host>/mcp \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+# → 200 with the tool list
+```
+
+If `/healthz` returns 200 and `/mcp` returns 401 without auth + 200 with auth, paste the URL and bearer token into claude.ai's connector setup.
