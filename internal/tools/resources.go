@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,7 +13,35 @@ import (
 	"time"
 
 	"github.com/jawadh/moodle-mcp-server/internal/api"
+	"github.com/ledongthuc/pdf"
 )
+
+// extractPDFText pulls the plain text out of a PDF byte slice using a pure-Go
+// parser. Returns an empty string with nil error if the PDF is image-only or
+// otherwise lacks extractable text — caller should treat empty as "no text".
+// Returns a wrapped error only on hard parse failures.
+func extractPDFText(data []byte) (string, error) {
+	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", fmt.Errorf("opening pdf: %w", err)
+	}
+	var buf strings.Builder
+	for i := 1; i <= r.NumPage(); i++ {
+		p := r.Page(i)
+		if p.V.IsNull() {
+			continue
+		}
+		text, err := p.GetPlainText(nil)
+		if err != nil {
+			// Skip the bad page rather than fail the whole document — partial
+			// text is still useful to the model.
+			continue
+		}
+		buf.WriteString(text)
+		buf.WriteString("\n\n")
+	}
+	return strings.TrimSpace(buf.String()), nil
+}
 
 // --- Resource types ---
 
@@ -37,12 +66,14 @@ type ResourceSection struct {
 }
 
 type ResourceDisplay struct {
-	ModuleID int    `json:"module_id"`
-	Name     string `json:"name"`
-	Filename string `json:"filename"`
-	SizeMB   string `json:"size_mb"`
-	MimeType string `json:"mime_type"`
-	Section  string `json:"section"`
+	ModuleID  int    `json:"module_id"`
+	FileIndex int    `json:"file_index"` // 0 for single-file modules; >0 for additional files in folder modules
+	Name      string `json:"name"`
+	Filename  string `json:"filename"`
+	SizeMB    string `json:"size_mb"`
+	MimeType  string `json:"mime_type"`
+	Section   string `json:"section"`
+	ModName   string `json:"modname,omitempty"` // "folder" if this row came from a folder module
 }
 
 // --- List Resources Tool ---
@@ -68,21 +99,26 @@ func HandleListResources(ctx context.Context, client *api.Client, input ListReso
 	var resources []ResourceDisplay
 	for _, sec := range sections {
 		for _, mod := range sec.Modules {
+			fileIdx := 0
 			for _, f := range mod.Contents {
 				if f.Type != "file" {
 					continue
 				}
 				if input.MimeType != "" && !strings.Contains(f.MimeType, input.MimeType) {
+					fileIdx++ // keep the index aligned with the original module.contents order
 					continue
 				}
 				resources = append(resources, ResourceDisplay{
-					ModuleID: mod.ID,
-					Name:     mod.Name,
-					Filename: f.Filename,
-					SizeMB:   fmt.Sprintf("%.1f MB", float64(f.FileSize)/1024/1024),
-					MimeType: f.MimeType,
-					Section:  sec.Name,
+					ModuleID:  mod.ID,
+					FileIndex: fileIdx,
+					Name:      mod.Name,
+					Filename:  f.Filename,
+					SizeMB:    fmt.Sprintf("%.1f MB", float64(f.FileSize)/1024/1024),
+					MimeType:  f.MimeType,
+					Section:   sec.Name,
+					ModName:   mod.ModName,
 				})
+				fileIdx++
 			}
 		}
 	}
@@ -104,20 +140,25 @@ func HandleListResources(ctx context.Context, client *api.Client, input ListReso
 const MaxInlineFileBytes int64 = 10 * 1024 * 1024 // 10 MB
 
 type ReadResourceInput struct {
-	CourseID int `json:"course_id" jsonschema:"description=The Moodle course ID containing the resource"`
-	ModuleID int `json:"module_id" jsonschema:"description=The module ID of the resource to read (get from list_resources)"`
+	CourseID  int `json:"course_id" jsonschema:"description=The Moodle course ID containing the resource"`
+	ModuleID  int `json:"module_id" jsonschema:"description=The module ID of the resource to read (get from list_resources)"`
+	FileIndex int `json:"file_index,omitempty" jsonschema:"description=Index into the module's file list (0-based; default 0). Folder modules contain multiple files — use the file_index from list_resources to pick a specific one."`
 }
 
 // ReadResourceOutput is the structured payload returned to the tool registration
-// layer; the registration converts it into an mcp.CallToolResult that embeds the
-// bytes as a base64 BlobResourceContents alongside a human-readable description.
+// layer. The registration converts it into an mcp.CallToolResult: when
+// ExtractedText is non-empty, it is the primary content (works in clients that
+// don't render binary blobs, e.g. claude.ai web). The raw Bytes are also
+// returned alongside as a base64 BlobResourceContents for clients that can
+// render the original binary.
 type ReadResourceOutput struct {
-	Description string // text shown to the model (filename, size, mime)
-	URI         string // canonical resource URI
-	Filename    string
-	MimeType    string
-	Size        int64
-	Bytes       []byte // raw file bytes; caller is responsible for base64-encoding
+	Description   string // text shown to the model (filename, size, mime)
+	URI           string // canonical resource URI
+	Filename      string
+	MimeType      string
+	Size          int64
+	Bytes         []byte // raw file bytes; caller is responsible for base64-encoding
+	ExtractedText string // best-effort plain text (PDFs, text files); empty if unavailable
 }
 
 func HandleReadResource(ctx context.Context, client *api.Client, input ReadResourceInput) (*ReadResourceOutput, error) {
@@ -136,24 +177,37 @@ func HandleReadResource(ctx context.Context, client *api.Client, input ReadResou
 		return nil, err
 	}
 
+	// Locate the module and pick the file_index'th file inside it.
 	var targetFile *FileContent
-	var moduleName string
+	var moduleName, modName string
+	var totalFiles int
 	for _, sec := range sections {
 		for _, mod := range sec.Modules {
-			if mod.ID == input.ModuleID {
-				moduleName = mod.Name
-				for _, f := range mod.Contents {
-					if f.Type == "file" {
-						fc := f
-						targetFile = &fc
-						break
-					}
-				}
+			if mod.ID != input.ModuleID {
+				continue
 			}
+			moduleName = mod.Name
+			modName = mod.ModName
+			fileIdx := 0
+			for _, f := range mod.Contents {
+				if f.Type != "file" {
+					continue
+				}
+				if fileIdx == input.FileIndex {
+					fc := f
+					targetFile = &fc
+				}
+				fileIdx++
+			}
+			totalFiles = fileIdx
 		}
 	}
 	if targetFile == nil {
-		return nil, fmt.Errorf("no downloadable file found for module_id %d in course %d", input.ModuleID, input.CourseID)
+		if totalFiles == 0 {
+			return nil, fmt.Errorf("no downloadable file found for module_id %d in course %d", input.ModuleID, input.CourseID)
+		}
+		return nil, fmt.Errorf("file_index %d out of range for module %d (it has %d file(s); valid indices 0..%d)",
+			input.FileIndex, input.ModuleID, totalFiles, totalFiles-1)
 	}
 	if targetFile.FileSize > MaxInlineFileBytes {
 		return nil, fmt.Errorf("file %q is %.1f MB, exceeds %d MB inline limit; use download_resource (local stdio mode) instead",
@@ -190,16 +244,33 @@ func HandleReadResource(ctx context.Context, client *api.Client, input ReadResou
 		return nil, fmt.Errorf("file body exceeded %d MB inline limit during streaming", MaxInlineFileBytes/(1024*1024))
 	}
 
-	desc := fmt.Sprintf("Module %q file %q (%s, %.1f MB) returned inline as base64 blob.",
-		moduleName, targetFile.Filename, targetFile.MimeType, float64(len(body))/1024/1024)
+	// Best-effort text extraction. We always try when the MIME suggests it.
+	// Empty result is OK — the caller falls back to the blob.
+	var extracted string
+	switch {
+	case strings.HasPrefix(targetFile.MimeType, "application/pdf"):
+		if t, err := extractPDFText(body); err == nil {
+			extracted = t
+		}
+	case strings.HasPrefix(targetFile.MimeType, "text/"):
+		extracted = string(body)
+	}
+
+	folderHint := ""
+	if modName == "folder" {
+		folderHint = fmt.Sprintf(" (file %d of %d in folder)", input.FileIndex+1, totalFiles)
+	}
+	desc := fmt.Sprintf("Module %q%s — file %q (%s, %.1f MB).",
+		moduleName, folderHint, targetFile.Filename, targetFile.MimeType, float64(len(body))/1024/1024)
 
 	return &ReadResourceOutput{
-		Description: desc,
-		URI:         fmt.Sprintf("moodle://course/%d/module/%d/%s", input.CourseID, input.ModuleID, targetFile.Filename),
-		Filename:    targetFile.Filename,
-		MimeType:    targetFile.MimeType,
-		Size:        int64(len(body)),
-		Bytes:       body,
+		Description:   desc,
+		URI:           fmt.Sprintf("moodle://course/%d/module/%d/idx/%d/%s", input.CourseID, input.ModuleID, input.FileIndex, targetFile.Filename),
+		Filename:      targetFile.Filename,
+		MimeType:      targetFile.MimeType,
+		Size:          int64(len(body)),
+		Bytes:         body,
+		ExtractedText: extracted,
 	}, nil
 }
 

@@ -376,23 +376,43 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 	// ── Read Resource (inline; preferred for remote/HTTP mode) ────
 	s.AddTool(
 		mcp.NewTool("read_resource",
-			mcp.WithDescription("Fetch a file (PDF, slides, etc.) from Moodle and return its content INLINE so the model can read it directly. Preferred for remote/HTTP deployments where the server has no access to the user's filesystem. Max 10 MB; use download_resource for larger files in stdio mode. Use list_resources to find module IDs."),
+			mcp.WithDescription("Fetch a file (PDF, slides, etc.) from Moodle and return its content INLINE so the model can read it directly. For PDFs and text files, returns extracted plain text (works in clients that don't render binary blobs, e.g. claude.ai web). For other binary types, returns a base64 BlobResourceContents. Preferred for remote/HTTP deployments. Max 10 MB; use download_resource for larger files in stdio mode. Folder modules contain multiple files — use list_resources to discover (module_id, file_index) pairs."),
 			mcp.WithNumber("course_id", mcp.Required(), mcp.Description("The Moodle course ID")),
 			mcp.WithNumber("module_id", mcp.Required(), mcp.Description("The module ID of the resource (from list_resources)")),
+			mcp.WithNumber("file_index", mcp.Description("0-based index into the module's file list. Default 0. For folder modules, list_resources reports the index for each contained file.")),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			out, err := tools.HandleReadResource(ctx, client, tools.ReadResourceInput{
-				CourseID: intArg(req, "course_id"),
-				ModuleID: intArg(req, "module_id"),
+				CourseID:  intArg(req, "course_id"),
+				ModuleID:  intArg(req, "module_id"),
+				FileIndex: intArg(req, "file_index"),
 			})
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
-			return mcp.NewToolResultResource(out.Description, mcp.BlobResourceContents{
-				URI:      out.URI,
-				MIMEType: out.MimeType,
-				Blob:     base64.StdEncoding.EncodeToString(out.Bytes),
-			}), nil
+			// First content block: human-readable description.
+			content := []mcp.Content{
+				mcp.TextContent{Type: mcp.ContentTypeText, Text: out.Description},
+			}
+			// Second block: extracted text if available (works in clients that
+			// don't decode binary blobs). Otherwise fall back to the raw blob
+			// resource for clients that DO render binary (Claude Desktop etc.).
+			if out.ExtractedText != "" {
+				content = append(content, mcp.TextContent{
+					Type: mcp.ContentTypeText,
+					Text: "Content:\n\n" + out.ExtractedText,
+				})
+			} else {
+				content = append(content, mcp.EmbeddedResource{
+					Type: mcp.ContentTypeResource,
+					Resource: mcp.BlobResourceContents{
+						URI:      out.URI,
+						MIMEType: out.MimeType,
+						Blob:     base64.StdEncoding.EncodeToString(out.Bytes),
+					},
+				})
+			}
+			return &mcp.CallToolResult{Content: content}, nil
 		},
 	)
 
