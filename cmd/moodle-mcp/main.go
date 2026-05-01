@@ -376,7 +376,7 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 	// ── Read Resource (inline; preferred for remote/HTTP mode) ────
 	s.AddTool(
 		mcp.NewTool("read_resource",
-			mcp.WithDescription("Fetch a file from Moodle and return its content INLINE so the model can read it directly. Plain text is extracted server-side for: PDFs, .docx, .pptx, .xlsx, and any text/* MIME (works in clients that don't render binary blobs, e.g. claude.ai web). Other binary types fall back to a base64 BlobResourceContents (max 10 MB raw). Files up to 50 MB raw are accepted as long as their extracted text fits the response (large textbook PDFs typically work fine). Folder modules contain multiple files — use list_resources to discover (module_id, file_index) pairs. Preferred over download_resource for any client that cannot read the server's filesystem."),
+			mcp.WithDescription("Fetch a file from Moodle and return its content INLINE so the model can read it directly. Plain text is extracted server-side for: PDFs, .docx, .pptx, .xlsx, and any text/* MIME (works in clients that don't render binary blobs, e.g. claude.ai web). Image-only / scanned PDFs whose text extraction is empty are rendered to PNG (up to 10 pages, 150 DPI) and returned as ImageContent so the model's vision can read them. Other binary types fall back to a base64 BlobResourceContents (max 10 MB raw). Files up to 50 MB raw are accepted as long as their extracted text or rendered pages fit the response. Folder modules contain multiple files — use list_resources to discover (module_id, file_index) pairs. Preferred over download_resource for any client that cannot read the server's filesystem."),
 			mcp.WithNumber("course_id", mcp.Required(), mcp.Description("The Moodle course ID")),
 			mcp.WithNumber("module_id", mcp.Required(), mcp.Description("The module ID of the resource (from list_resources)")),
 			mcp.WithNumber("file_index", mcp.Description("0-based index into the module's file list. Default 0. For folder modules, list_resources reports the index for each contained file.")),
@@ -394,15 +394,30 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 			content := []mcp.Content{
 				mcp.TextContent{Type: mcp.ContentTypeText, Text: out.Description},
 			}
-			// Second block: extracted text if available (works in clients that
-			// don't decode binary blobs). Otherwise fall back to the raw blob
-			// resource for clients that DO render binary (Claude Desktop etc.).
-			if out.ExtractedText != "" {
+			// Three mutually-exclusive payload paths, picked in priority order:
+			//   1) Extracted text (PDFs, Office docs, text/*) — universal client support.
+			//   2) Rendered PDF pages as ImageContent — for scanned/image-only PDFs;
+			//      claude.ai's vision can read them. Only fires when ExtractedText
+			//      was empty AND pdftoppm rendered at least one page.
+			//   3) Raw bytes as a base64 BlobResourceContents — last resort for
+			//      binaries that have no text extractor and aren't a renderable PDF
+			//      (e.g. small images, audio). Blob-rejecting clients see the
+			//      description but not the content.
+			switch {
+			case out.ExtractedText != "":
 				content = append(content, mcp.TextContent{
 					Type: mcp.ContentTypeText,
 					Text: "Content:\n\n" + out.ExtractedText,
 				})
-			} else {
+			case len(out.RenderedPNGs) > 0:
+				for _, png := range out.RenderedPNGs {
+					content = append(content, mcp.ImageContent{
+						Type:     mcp.ContentTypeImage,
+						Data:     base64.StdEncoding.EncodeToString(png),
+						MIMEType: "image/png",
+					})
+				}
+			default:
 				content = append(content, mcp.EmbeddedResource{
 					Type: mcp.ContentTypeResource,
 					Resource: mcp.BlobResourceContents{
@@ -410,6 +425,13 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 						MIMEType: out.MimeType,
 						Blob:     base64.StdEncoding.EncodeToString(out.Bytes),
 					},
+				})
+			}
+			// Optional render note (always last — explains the visual fallback).
+			if out.RenderNote != "" {
+				content = append(content, mcp.TextContent{
+					Type: mcp.ContentTypeText,
+					Text: out.RenderNote,
 				})
 			}
 			return &mcp.CallToolResult{Content: content}, nil

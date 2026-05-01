@@ -17,8 +17,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o moodle-mcp ./cmd/moodle-mcp/
 # Final stage
 FROM alpine:latest
 
-# Install ca-certificates for HTTPS
-RUN apk --no-cache add ca-certificates
+# Install ca-certificates for HTTPS, plus poppler-utils for the pdftoppm
+# binary that backs the read_resource image-fallback path (scanned/image-only
+# PDFs are rendered to PNG and returned as ImageContent).
+RUN apk --no-cache add ca-certificates poppler-utils
 
 WORKDIR /app
 

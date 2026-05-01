@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -140,6 +141,17 @@ type ReadResourceOutput struct {
 	Size          int64
 	Bytes         []byte // raw file bytes; caller is responsible for base64-encoding
 	ExtractedText string // best-effort plain text (PDFs, text files); empty if unavailable
+
+	// RenderedPNGs is populated for PDFs whose ExtractedText was empty
+	// (typically image-only / scanned PDFs) when pdftoppm is available.
+	// Each entry is a PNG byte slice for one rendered page; the registration
+	// layer encodes them as mcp.ImageContent blocks so claude.ai's vision
+	// model can read the visual content. Empty if no render attempted.
+	RenderedPNGs [][]byte
+	// RenderNote, when non-empty, is appended as a TextContent block by the
+	// registration layer to explain to the model what just happened (number
+	// of pages rendered, dropped pages, or why the fallback couldn't fire).
+	RenderNote string
 }
 
 func HandleReadResource(ctx context.Context, client *api.Client, input ReadResourceInput) (*ReadResourceOutput, error) {
@@ -234,11 +246,43 @@ func HandleReadResource(ctx context.Context, client *api.Client, input ReadResou
 			"\n\n[truncated: returned %d of %d chars; ask the user for a smaller section or use download_resource in stdio mode for the full file]",
 			MaxExtractedTextBytes, len(extracted))
 	}
-	// If no extraction was possible, the raw bytes will be returned as a blob
-	// — gate THAT on the (smaller) MaxInlineBlobBytes.
-	if extracted == "" && int64(len(body)) > MaxInlineBlobBytes {
-		return nil, fmt.Errorf("binary file %q is %.1f MB and no text extractor is available; exceeds %d MB blob inline limit. Use download_resource (local stdio mode) for the full file",
-			targetFile.Filename, float64(len(body))/1024/1024, MaxInlineBlobBytes/(1024*1024))
+
+	// Image-fallback: if this is a PDF and we got no text, try rendering pages
+	// as PNGs so the model's vision can read them. Only fires for PDFs (other
+	// extensionless / unknown binaries fall through to the blob path).
+	var renderedPNGs [][]byte
+	var renderNote string
+	isPDF := strings.HasPrefix(targetFile.MimeType, "application/pdf") ||
+		(targetFile.MimeType == "" && len(body) >= 5 && string(body[:5]) == "%PDF-")
+	if extracted == "" && isPDF {
+		pngs, err := renderPDFAsPNGs(body, MaxRenderPages, RenderDPI)
+		switch {
+		case err == nil && len(pngs) > 0:
+			trimmed, dropped := trimPNGsToBudget(pngs, MaxRenderPNGBytes, MaxRenderTotalBytes)
+			renderedPNGs = trimmed
+			if dropped > 0 {
+				renderNote = fmt.Sprintf("PDF text extraction returned empty; rendered %d of %d page(s) as PNG (%d dropped to fit response budget). The model can read the page images visually.",
+					len(trimmed), len(pngs), dropped)
+			} else {
+				renderNote = fmt.Sprintf("PDF text extraction returned empty; rendered %d page(s) as PNG so the model can read them visually.",
+					len(trimmed))
+			}
+		case errors.Is(err, errPdftoppmMissing):
+			renderNote = "PDF appears image-only and pdftoppm is not installed in this environment; cannot fall back to visual rendering."
+		case err != nil:
+			renderNote = fmt.Sprintf("PDF appears image-only; visual fallback failed: %v.", err)
+		}
+	}
+
+	// If no extraction AND no rendered fallback, the raw bytes will be returned
+	// as a blob — gate THAT on the (smaller) MaxInlineBlobBytes.
+	if extracted == "" && len(renderedPNGs) == 0 && int64(len(body)) > MaxInlineBlobBytes {
+		hint := ""
+		if renderNote != "" {
+			hint = " " + renderNote
+		}
+		return nil, fmt.Errorf("binary file %q is %.1f MB and no text extractor or visual renderer succeeded; exceeds %d MB blob inline limit. Use download_resource (local stdio mode) for the full file.%s",
+			targetFile.Filename, float64(len(body))/1024/1024, MaxInlineBlobBytes/(1024*1024), hint)
 	}
 
 	folderHint := ""
@@ -256,6 +300,8 @@ func HandleReadResource(ctx context.Context, client *api.Client, input ReadResou
 		Size:          int64(len(body)),
 		Bytes:         body,
 		ExtractedText: extracted,
+		RenderedPNGs:  renderedPNGs,
+		RenderNote:    renderNote,
 	}, nil
 }
 
