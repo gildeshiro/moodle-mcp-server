@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -14,7 +15,7 @@ const (
 
 func newTestProvider(t *testing.T) *Provider {
 	t.Helper()
-	return NewProvider("http://localhost:8772")
+	return NewProvider("http://localhost:8772", "")
 }
 
 func TestRegisterClient_Validation(t *testing.T) {
@@ -138,5 +139,80 @@ func TestUnknownClient(t *testing.T) {
 	p := newTestProvider(t)
 	if _, err := p.IssueCode("nonexistent", "http://localhost:9999/cb", testChallenge, "S256", ""); !errors.Is(err, ErrUnknownClient) {
 		t.Errorf("unknown client should fail, got %v", err)
+	}
+}
+
+// TestProvider_PersistAndReload exercises the on-disk persistence: we register
+// a client + issue a code on one Provider instance, then construct a fresh
+// instance pointed at the same statePath and verify the registered client
+// (and live code) survive the rebuild. Mirrors the Railway restart story.
+func TestProvider_PersistAndReload(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "oauth-state.json")
+
+	p1 := NewProvider("http://localhost:8772", statePath)
+	c, err := p1.RegisterClient([]string{"http://localhost:9999/cb"}, "persist-smoke")
+	if err != nil {
+		t.Fatalf("RegisterClient: %v", err)
+	}
+	code, err := p1.IssueCode(c.ID, "http://localhost:9999/cb", testChallenge, "S256", "openid")
+	if err != nil {
+		t.Fatalf("IssueCode: %v", err)
+	}
+
+	// Second provider instance — simulates a process restart.
+	p2 := NewProvider("http://localhost:8772", statePath)
+	got, ok := p2.GetClient(c.ID)
+	if !ok {
+		t.Fatalf("client %q lost after reload", c.ID)
+	}
+	if got.Name != "persist-smoke" {
+		t.Errorf("client name not preserved: got %q", got.Name)
+	}
+	if len(got.RedirectURIs) != 1 || got.RedirectURIs[0] != "http://localhost:9999/cb" {
+		t.Errorf("redirect URIs not preserved: %v", got.RedirectURIs)
+	}
+
+	// The pre-existing authorization code should still be exchangeable.
+	tok, err := p2.ExchangeCode(code, testVerifier, c.ID, "http://localhost:9999/cb")
+	if err != nil {
+		t.Fatalf("ExchangeCode after reload: %v", err)
+	}
+	if tok.Token == "" {
+		t.Fatal("expected non-empty access token after reload")
+	}
+
+	// And the freshly-issued token should also persist into a third provider.
+	p3 := NewProvider("http://localhost:8772", statePath)
+	if _, ok := p3.ValidateToken(tok.Token); !ok {
+		t.Errorf("access token issued via p2 did not survive reload into p3")
+	}
+}
+
+// TestProvider_LoadDropsExpired ensures that authorization codes / tokens
+// written to disk while live become invisible to a reloaded provider once
+// they have expired.
+func TestProvider_LoadDropsExpired(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "oauth-state.json")
+
+	p1 := NewProvider("http://localhost:8772", statePath)
+	c, _ := p1.RegisterClient([]string{"http://localhost:9999/cb"}, "")
+	code, _ := p1.IssueCode(c.ID, "http://localhost:9999/cb", testChallenge, "S256", "")
+
+	// Backdate the persisted code's ExpiresAt and re-persist so the file on
+	// disk reflects an already-expired entry.
+	p1.mu.Lock()
+	p1.codes[code].ExpiresAt = time.Now().Add(-time.Minute)
+	p1.mu.Unlock()
+	p1.persist()
+
+	p2 := NewProvider("http://localhost:8772", statePath)
+	if _, err := p2.ExchangeCode(code, testVerifier, c.ID, "http://localhost:9999/cb"); !errors.Is(err, ErrUnknownCode) {
+		t.Errorf("expired code should not survive reload, got %v", err)
+	}
+	// Client itself must still be loadable — it does not expire.
+	if _, ok := p2.GetClient(c.ID); !ok {
+		t.Error("client should survive even if its codes have expired")
 	}
 }

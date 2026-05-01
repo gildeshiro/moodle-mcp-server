@@ -28,6 +28,7 @@ func main() {
 	httpPath := flag.String("http-path", "/mcp", "MCP endpoint path for http mode (env: MCP_HTTP_PATH)")
 	useOAuth := flag.Bool("oauth", false, "Enable OAuth 2.1 + DCR for http mode (env: MCP_USE_OAUTH)")
 	oauthIssuer := flag.String("oauth-issuer", "", "Public base URL of the deployment, required when -oauth (env: MCP_OAUTH_ISSUER)")
+	oauthStateFile := flag.String("oauth-state-file", "", "Path to OAuth state JSON file; when set, registered clients/codes/tokens survive restart (env: MCP_OAUTH_STATE_FILE)")
 	flag.Parse()
 
 	// Load config from environment
@@ -58,6 +59,9 @@ func main() {
 	}
 	if v := os.Getenv("MCP_OAUTH_ISSUER"); v != "" {
 		*oauthIssuer = v
+	}
+	if v := os.Getenv("MCP_OAUTH_STATE_FILE"); v != "" {
+		*oauthStateFile = v
 	}
 	// Honor PORT env from cloud platforms (Railway, Render, Fly, Cloud Run)
 	if envPort := os.Getenv("PORT"); envPort != "" {
@@ -101,7 +105,7 @@ func main() {
 	case "rest":
 		runRESTServer(client, *restPort)
 	case "http":
-		runStreamableHTTPServer(client, *restPort, *authToken, *corsOrigins, *httpPath, *useOAuth, *oauthIssuer)
+		runStreamableHTTPServer(client, *restPort, *authToken, *corsOrigins, *httpPath, *useOAuth, *oauthIssuer, *oauthStateFile)
 	case "both":
 		log.Println("Running both MCP and REST servers (experimental)")
 		go runRESTServer(client, *restPort)
@@ -141,7 +145,7 @@ func runRESTServer(client *api.Client, port int) {
 	}
 }
 
-func runStreamableHTTPServer(client *api.Client, port int, authToken, corsOrigins, path string, useOAuth bool, issuer string) {
+func runStreamableHTTPServer(client *api.Client, port int, authToken, corsOrigins, path string, useOAuth bool, issuer, oauthStateFile string) {
 	s := mcpserver.NewMCPServer(
 		"moodle-mcp-server",
 		"1.2.0",
@@ -164,7 +168,7 @@ func runStreamableHTTPServer(client *api.Client, port int, authToken, corsOrigin
 			fmt.Fprintln(os.Stderr, "MCP_OAUTH_ISSUER is required when MCP_USE_OAUTH=1 (the public base URL of this deployment, e.g. https://moodle-mcp.example.com)")
 			os.Exit(1)
 		}
-		opts.OAuthProvider = oauth.NewProvider(issuer)
+		opts.OAuthProvider = oauth.NewProvider(issuer, oauthStateFile)
 	default:
 		// Existing modes: bearer-static or URL-as-secret. Mutually exclusive
 		// with OAuth, enforced by the boot guard in RunStreamable.
@@ -650,17 +654,29 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 	// ── Post Forum Reply ─────────────────────────────────────────
 	s.AddTool(
 		mcp.NewTool("post_forum_reply",
-			mcp.WithDescription("Post a reply to a Moodle forum post. post_id is the PARENT post id (use get_forum_discussion to find it). HTML formatting is supported in the message body."),
+			mcp.WithDescription("Post a reply to a Moodle forum post. post_id is the PARENT post id (use get_forum_discussion to find it). HTML formatting is supported in the message body. Optional file attachments: pass an `attachments` array of {filename, content_base64} objects — all files are uploaded into a single Moodle draft area and attached to the reply. Per-file size limit depends on the Moodle instance (typical default ~10 MB)."),
 			mcp.WithNumber("post_id", mcp.Required(), mcp.Description("The PARENT post ID to reply under (from get_forum_discussion)")),
 			mcp.WithString("subject", mcp.Required(), mcp.Description("Subject line of the reply")),
 			mcp.WithString("message", mcp.Required(), mcp.Description("The message body (HTML supported)")),
+			mcp.WithArray("attachments",
+				mcp.Description("Optional array of file attachments. Each item: {filename, content_base64}. data: URI prefixes are accepted in content_base64."),
+				mcp.Items(map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"filename":       map[string]any{"type": "string", "description": "Filename (e.g. report.pdf)"},
+						"content_base64": map[string]any{"type": "string", "description": "Base64-encoded file content"},
+					},
+					"required": []string{"filename", "content_base64"},
+				}),
+			),
 		),
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			postID := intArg(req, "post_id")
 			subject := mcp.ParseString(req, "subject", "")
 			message := mcp.ParseString(req, "message", "")
+			attachments := parseForumAttachments(req)
 			result, err := tools.HandlePostForumReply(ctx, client, tools.PostForumReplyInput{
-				PostID: postID, Subject: subject, Message: message,
+				PostID: postID, Subject: subject, Message: message, Attachments: attachments,
 			})
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
@@ -746,6 +762,93 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 		},
 	)
 
+	// ── Start Quiz Attempt ───────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("start_quiz_attempt",
+			mcp.WithDescription("Begin a new attempt at a Moodle quiz. First step in the quiz-taking chain: start_quiz_attempt → get_quiz_question → save_quiz_answers → submit_quiz_attempt. Returns the attempt_id required by every subsequent quiz tool, plus the layout (slot order, with 0 markers separating pages) and total_questions count. WARNING: this counts as a real attempt against the user's allotted attempts."),
+			mcp.WithNumber("quiz_id", mcp.Required(), mcp.Description("The Moodle quiz ID (from list_quizzes) to begin a fresh attempt against")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			id := intArg(req, "quiz_id")
+			result, err := tools.HandleStartQuizAttempt(ctx, client, tools.StartQuizAttemptInput{QuizID: id})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── Get Quiz Question ────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("get_quiz_question",
+			mcp.WithDescription("Fetch the questions on one page of an in-progress quiz attempt. Returns each question's slot, type, html_question_text, and answer_field_names — the OPAQUE Moodle field names (like 'q12345:1_answer') the model must echo back verbatim when calling save_quiz_answers. Supported types: multichoice (single + multiple), truefalse, shortanswer, numerical, essay (text only). Heterogeneous types (drag-and-drop, gap-select, hot-spot, matching) may return parseable HTML but answer submission is NOT GUARANTEED to work for them."),
+			mcp.WithNumber("attempt_id", mcp.Required(), mcp.Description("The attempt_id returned by start_quiz_attempt")),
+			mcp.WithNumber("page", mcp.Description("The 0-based page number to fetch (default 0). Quizzes can span multiple pages; layout from start_quiz_attempt indicates page breaks via 0 markers.")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			attemptID := intArg(req, "attempt_id")
+			page := intArg(req, "page")
+			result, err := tools.HandleGetQuizQuestion(ctx, client, tools.GetQuizQuestionInput{
+				AttemptID: attemptID, Page: page,
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── Save Quiz Answers ────────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("save_quiz_answers",
+			mcp.WithDescription("Save answers for a page of an in-progress attempt WITHOUT submitting the whole quiz. The `answers` parameter is a map: keys are the answer_field_names returned by get_quiz_question (opaque tokens like 'q12345:1_answer'); values are the answer payloads (multichoice → choice index as string; truefalse → '1' or '0'; shortanswer/numerical/essay → user text). Call submit_quiz_attempt when ready to finalize the whole attempt. Complex question types (drag-drop, hot-spot, gap-select) may not work — feedback welcome."),
+			mcp.WithNumber("attempt_id", mcp.Required(), mcp.Description("The attempt_id returned by start_quiz_attempt")),
+			mcp.WithNumber("page", mcp.Description("The 0-based page number being saved (default 0)")),
+			mcp.WithObject("answers",
+				mcp.Required(),
+				mcp.Description("Map of answer_field_name → string value. Keys are opaque tokens from get_quiz_question; values are user-provided answers."),
+				mcp.AdditionalProperties(map[string]any{"type": "string"}),
+			),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			attemptID := intArg(req, "attempt_id")
+			page := intArg(req, "page")
+			answers := stringMapArg(req, "answers")
+			result, err := tools.HandleSaveQuizAnswers(ctx, client, tools.SaveQuizAnswersInput{
+				AttemptID: attemptID, Page: page, Answers: answers,
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
+	// ── Submit Quiz Attempt ──────────────────────────────────────
+	s.AddTool(
+		mcp.NewTool("submit_quiz_attempt",
+			mcp.WithDescription("Process / finalize a quiz attempt. With finalize=true, the attempt becomes 'finished' and counts toward the grade — IRREVERSIBLE on most Moodle servers. With finalize=false, just commits whatever has been saved without ending the attempt (use to navigate between pages or persist progress). Returns the resulting state and any warnings."),
+			mcp.WithNumber("attempt_id", mcp.Required(), mcp.Description("The attempt_id returned by start_quiz_attempt")),
+			mcp.WithBoolean("finalize", mcp.Description("Whether to finish the attempt (true → graded, irreversible) or just commit (false). Default false.")),
+		),
+		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			attemptID := intArg(req, "attempt_id")
+			finalize := false
+			if v, ok := req.GetArguments()["finalize"]; ok {
+				if b, ok := v.(bool); ok {
+					finalize = b
+				}
+			}
+			result, err := tools.HandleSubmitQuizAttempt(ctx, client, tools.SubmitQuizAttemptInput{
+				AttemptID: attemptID, Finalize: finalize,
+			})
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			return mcp.NewToolResultText(result), nil
+		},
+	)
+
 	// ── List Lessons ─────────────────────────────────────────────
 	s.AddTool(
 		mcp.NewTool("list_lessons",
@@ -798,4 +901,59 @@ func intArg(req mcp.CallToolRequest, key string) int {
 		}
 	}
 	return 0
+}
+
+// stringMapArg extracts a string→string map from request arguments. Used for
+// the quiz-answer payload where the keys are opaque Moodle field names. Any
+// value type other than string is coerced via fmt.Sprint so callers don't
+// have to worry about JSON-number rounding.
+func stringMapArg(req mcp.CallToolRequest, key string) map[string]string {
+	v, ok := req.GetArguments()[key]
+	if !ok {
+		return nil
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, val := range m {
+		if s, ok := val.(string); ok {
+			out[k] = s
+			continue
+		}
+		out[k] = fmt.Sprint(val)
+	}
+	return out
+}
+
+// parseForumAttachments pulls the optional `attachments` array out of the
+// MCP tool-call payload. Each entry is decoded as {filename, content_base64};
+// malformed entries are silently skipped — the handler then validates the
+// remainder and returns a structured error if any required field is missing.
+func parseForumAttachments(req mcp.CallToolRequest) []tools.ForumAttachment {
+	v, ok := req.GetArguments()["attachments"]
+	if !ok {
+		return nil
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]tools.ForumAttachment, 0, len(arr))
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		var att tools.ForumAttachment
+		if s, ok := m["filename"].(string); ok {
+			att.Filename = s
+		}
+		if s, ok := m["content_base64"].(string); ok {
+			att.ContentBase64 = s
+		}
+		out = append(out, att)
+	}
+	return out
 }

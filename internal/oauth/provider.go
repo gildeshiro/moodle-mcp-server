@@ -5,8 +5,11 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -41,36 +44,48 @@ var (
 // is implicitly "none" — public clients only, since DCR with no operator
 // review can't issue real client secrets safely.
 type Client struct {
-	ID              string
-	RedirectURIs    []string
-	Name            string
-	IssuedAtUnix    int64
+	ID           string   `json:"id"`
+	RedirectURIs []string `json:"redirect_uris"`
+	Name         string   `json:"name,omitempty"`
+	IssuedAtUnix int64    `json:"issued_at_unix"`
 }
 
 // AuthCode is a single-use authorization-code grant tied to a client+redirect
 // pair, with PKCE state captured at /authorize time.
 type AuthCode struct {
-	Code          string
-	ClientID      string
-	RedirectURI   string
-	CodeChallenge string // S256 only (method enforced at issue time)
-	Scope         string
-	ExpiresAt     time.Time
+	Code          string    `json:"code"`
+	ClientID      string    `json:"client_id"`
+	RedirectURI   string    `json:"redirect_uri"`
+	CodeChallenge string    `json:"code_challenge"` // S256 only (method enforced at issue time)
+	Scope         string    `json:"scope,omitempty"`
+	ExpiresAt     time.Time `json:"expires_at"`
 }
 
 // AccessToken is the bearer credential used at /mcp. Opaque (no JWT claims).
 type AccessToken struct {
-	Token     string
-	ClientID  string
-	Scope     string
-	ExpiresAt time.Time
+	Token     string    `json:"token"`
+	ClientID  string    `json:"client_id"`
+	Scope     string    `json:"scope,omitempty"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// Provider holds the in-memory state for the single-tenant OAuth server.
-// Storage is map+mutex; restart wipes everything (fine for the deploy model:
-// agents re-register dynamically on every fresh connection).
+// persistedState is the on-disk JSON shape used when MCP_OAUTH_STATE_FILE is
+// set. It bundles all state-bearing maps so a single atomic write covers them.
+// Expired codes / tokens are pruned during load so the in-memory maps never
+// contain dead entries.
+type persistedState struct {
+	Clients map[string]*Client      `json:"clients"`
+	Codes   map[string]*AuthCode    `json:"codes"`
+	Tokens  map[string]*AccessToken `json:"tokens"`
+}
+
+// Provider holds the OAuth state for the single-tenant server. By default
+// storage is map+mutex only and restart wipes everything; with statePath set,
+// state is mirrored to a JSON file (atomic write via tempfile + rename) so
+// dynamically-registered clients survive process restarts.
 type Provider struct {
-	issuer string
+	issuer    string
+	statePath string
 
 	mu           sync.RWMutex
 	clients      map[string]*Client
@@ -80,13 +95,24 @@ type Provider struct {
 
 // NewProvider returns a Provider whose discovery endpoints will advertise the
 // given public base URL as the issuer. issuer should NOT end with a slash.
-func NewProvider(issuer string) *Provider {
-	return &Provider{
+//
+// When statePath is non-empty the provider mirrors clients/codes/tokens to a
+// JSON file at that path: on construction the file (if any) is loaded and
+// expired entries are dropped; after every state-changing operation
+// (RegisterClient, IssueCode, ExchangeCode, GC sweep) the file is rewritten
+// atomically (tempfile in the same directory + os.Rename). When statePath is
+// empty the persistence layer is a no-op and behavior is unchanged from the
+// pre-persistence implementation.
+func NewProvider(issuer, statePath string) *Provider {
+	p := &Provider{
 		issuer:       strings.TrimRight(issuer, "/"),
+		statePath:    statePath,
 		clients:      make(map[string]*Client),
 		codes:        make(map[string]*AuthCode),
 		accessTokens: make(map[string]*AccessToken),
 	}
+	p.loadState()
+	return p
 }
 
 // Issuer returns the public base URL used for discovery and as the iss claim.
@@ -139,6 +165,7 @@ func (p *Provider) RegisterClient(redirectURIs []string, name string) (*Client, 
 	p.mu.Lock()
 	p.clients[c.ID] = c
 	p.mu.Unlock()
+	p.persist()
 	return c, nil
 }
 
@@ -192,6 +219,7 @@ func (p *Provider) IssueCode(clientID, redirectURI, codeChallenge, method, scope
 	p.mu.Lock()
 	p.codes[code] = ac
 	p.mu.Unlock()
+	p.persist()
 	return code, nil
 }
 
@@ -231,6 +259,7 @@ func (p *Provider) ExchangeCode(code, codeVerifier, clientID, redirectURI string
 	p.mu.Lock()
 	p.accessTokens[tok.Token] = tok
 	p.mu.Unlock()
+	p.persist()
 	return tok, nil
 }
 
@@ -281,7 +310,6 @@ func (p *Provider) StartGC(ctx context.Context) {
 func (p *Provider) gcCodes() {
 	now := time.Now()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	removed := 0
 	for k, c := range p.codes {
 		if now.After(c.ExpiresAt) {
@@ -289,15 +317,16 @@ func (p *Provider) gcCodes() {
 			removed++
 		}
 	}
+	p.mu.Unlock()
 	if removed > 0 {
 		log.Printf("oauth: gc swept %d expired authorization codes", removed)
+		p.persist()
 	}
 }
 
 func (p *Provider) gcTokens() {
 	now := time.Now()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	removed := 0
 	for k, t := range p.accessTokens {
 		if now.After(t.ExpiresAt) {
@@ -305,7 +334,111 @@ func (p *Provider) gcTokens() {
 			removed++
 		}
 	}
+	p.mu.Unlock()
 	if removed > 0 {
 		log.Printf("oauth: gc swept %d expired access tokens", removed)
+		p.persist()
+	}
+}
+
+// loadState reads the on-disk JSON state into the in-memory maps. Called once
+// from NewProvider when statePath is non-empty. Missing file is not an error
+// (fresh deployment); malformed file is logged and treated as empty so the
+// server still boots. Expired authorization codes and access tokens in the
+// loaded snapshot are dropped here so they never enter the runtime maps.
+func (p *Provider) loadState() {
+	if p.statePath == "" {
+		return
+	}
+	data, err := os.ReadFile(p.statePath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("oauth: read state file %q: %v", p.statePath, err)
+		}
+		return
+	}
+	if len(data) == 0 {
+		return
+	}
+	var s persistedState
+	if err := json.Unmarshal(data, &s); err != nil {
+		log.Printf("oauth: parse state file %q (starting empty): %v", p.statePath, err)
+		return
+	}
+	now := time.Now()
+	if s.Clients != nil {
+		p.clients = s.Clients
+	}
+	if s.Codes != nil {
+		for k, c := range s.Codes {
+			if c == nil || now.After(c.ExpiresAt) {
+				continue
+			}
+			p.codes[k] = c
+		}
+	}
+	if s.Tokens != nil {
+		for k, t := range s.Tokens {
+			if t == nil || now.After(t.ExpiresAt) {
+				continue
+			}
+			p.accessTokens[k] = t
+		}
+	}
+	log.Printf("oauth: loaded persisted state from %q (%d clients, %d codes, %d tokens)",
+		p.statePath, len(p.clients), len(p.codes), len(p.accessTokens))
+}
+
+// persist writes the current state to disk atomically (tempfile in the same
+// directory, then rename). No-op when statePath is empty. Errors are logged
+// but never returned: persistence is best-effort and a transient failure
+// (e.g. disk full) should not break an in-flight OAuth flow — the in-memory
+// maps remain authoritative for the running process.
+func (p *Provider) persist() {
+	if p.statePath == "" {
+		return
+	}
+	p.mu.RLock()
+	state := persistedState{
+		Clients: p.clients,
+		Codes:   p.codes,
+		Tokens:  p.accessTokens,
+	}
+	data, err := json.Marshal(state)
+	p.mu.RUnlock()
+	if err != nil {
+		log.Printf("oauth: marshal state: %v", err)
+		return
+	}
+
+	dir := filepath.Dir(p.statePath)
+	tmp, err := os.CreateTemp(dir, ".oauth-state-*.tmp")
+	if err != nil {
+		log.Printf("oauth: create state tempfile in %q: %v", dir, err)
+		return
+	}
+	tmpPath := tmp.Name()
+	// On any error past this point, attempt to clean up the tempfile.
+	cleanup := func() { _ = os.Remove(tmpPath) }
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		log.Printf("oauth: write state tempfile: %v", err)
+		return
+	}
+	if err := tmp.Chmod(0600); err != nil {
+		// Non-fatal on Windows where Chmod is largely cosmetic.
+		log.Printf("oauth: chmod state tempfile: %v", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		log.Printf("oauth: close state tempfile: %v", err)
+		return
+	}
+	if err := os.Rename(tmpPath, p.statePath); err != nil {
+		cleanup()
+		log.Printf("oauth: rename state file %q -> %q: %v", tmpPath, p.statePath, err)
+		return
 	}
 }
