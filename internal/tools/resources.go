@@ -1,7 +1,6 @@
 package tools
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,35 +12,7 @@ import (
 	"time"
 
 	"github.com/jawadh/moodle-mcp-server/internal/api"
-	"github.com/ledongthuc/pdf"
 )
-
-// extractPDFText pulls the plain text out of a PDF byte slice using a pure-Go
-// parser. Returns an empty string with nil error if the PDF is image-only or
-// otherwise lacks extractable text — caller should treat empty as "no text".
-// Returns a wrapped error only on hard parse failures.
-func extractPDFText(data []byte) (string, error) {
-	r, err := pdf.NewReader(bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		return "", fmt.Errorf("opening pdf: %w", err)
-	}
-	var buf strings.Builder
-	for i := 1; i <= r.NumPage(); i++ {
-		p := r.Page(i)
-		if p.V.IsNull() {
-			continue
-		}
-		text, err := p.GetPlainText(nil)
-		if err != nil {
-			// Skip the bad page rather than fail the whole document — partial
-			// text is still useful to the model.
-			continue
-		}
-		buf.WriteString(text)
-		buf.WriteString("\n\n")
-	}
-	return strings.TrimSpace(buf.String()), nil
-}
 
 // --- Resource types ---
 
@@ -133,11 +104,21 @@ func HandleListResources(ctx context.Context, client *api.Client, input ListReso
 
 // --- Read Resource Tool (returns content inline; useful for remote/HTTP mode) ---
 
-// MaxInlineFileBytes caps the size of files returned via HandleReadResource.
-// Anything larger should be retrieved with download_resource (stdio-mode) or
-// fetched outside the MCP path entirely. The base64 expansion of this limit
-// is ~13.3 MB on the wire, which most MCP clients comfortably handle.
-const MaxInlineFileBytes int64 = 10 * 1024 * 1024 // 10 MB
+// Size constants for read_resource. Three thresholds cover the three failure
+// modes:
+//   * MaxRawFetchBytes — refuse to even pull bytes off the network past this.
+//     OOM guard.
+//   * MaxInlineBlobBytes — when returning raw bytes as a base64
+//     BlobResourceContents (no text extraction available), cap here so the
+//     base64-encoded payload stays under ~13.3 MB on the wire.
+//   * MaxExtractedTextBytes — extracted text response cap. Most clients
+//     comfortably handle up to ~1 MB tool responses; we err on the side of
+//     headroom and add a clear truncation marker so the model knows.
+const (
+	MaxRawFetchBytes      int64 = 50 * 1024 * 1024 // 50 MB
+	MaxInlineBlobBytes    int64 = 10 * 1024 * 1024 // 10 MB
+	MaxExtractedTextBytes int   = 512 * 1024       // 512 KB
+)
 
 type ReadResourceInput struct {
 	CourseID  int `json:"course_id" jsonschema:"description=The Moodle course ID containing the resource"`
@@ -209,9 +190,9 @@ func HandleReadResource(ctx context.Context, client *api.Client, input ReadResou
 		return nil, fmt.Errorf("file_index %d out of range for module %d (it has %d file(s); valid indices 0..%d)",
 			input.FileIndex, input.ModuleID, totalFiles, totalFiles-1)
 	}
-	if targetFile.FileSize > MaxInlineFileBytes {
-		return nil, fmt.Errorf("file %q is %.1f MB, exceeds %d MB inline limit; use download_resource (local stdio mode) instead",
-			targetFile.Filename, float64(targetFile.FileSize)/1024/1024, MaxInlineFileBytes/(1024*1024))
+	if targetFile.FileSize > MaxRawFetchBytes {
+		return nil, fmt.Errorf("file %q is %.1f MB, exceeds %d MB fetch limit; use download_resource (local stdio mode) instead",
+			targetFile.Filename, float64(targetFile.FileSize)/1024/1024, MaxRawFetchBytes/(1024*1024))
 	}
 
 	downloadURL := targetFile.FileURL
@@ -235,25 +216,29 @@ func HandleReadResource(ctx context.Context, client *api.Client, input ReadResou
 		return nil, fmt.Errorf("fetch failed with status %d", resp.StatusCode)
 	}
 
-	// Cap the read so a server lying about Content-Length can't OOM us.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxInlineFileBytes+1))
+	// Cap the read at MaxRawFetchBytes — defense against a server lying about
+	// Content-Length.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxRawFetchBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("reading body: %w", err)
 	}
-	if int64(len(body)) > MaxInlineFileBytes {
-		return nil, fmt.Errorf("file body exceeded %d MB inline limit during streaming", MaxInlineFileBytes/(1024*1024))
+	if int64(len(body)) > MaxRawFetchBytes {
+		return nil, fmt.Errorf("file body exceeded %d MB fetch limit during streaming", MaxRawFetchBytes/(1024*1024))
 	}
 
-	// Best-effort text extraction. We always try when the MIME suggests it.
-	// Empty result is OK — the caller falls back to the blob.
-	var extracted string
-	switch {
-	case strings.HasPrefix(targetFile.MimeType, "application/pdf"):
-		if t, err := extractPDFText(body); err == nil {
-			extracted = t
-		}
-	case strings.HasPrefix(targetFile.MimeType, "text/"):
-		extracted = string(body)
+	// Try text extraction first (PDF, Office docs, text/*). The dispatcher
+	// also magic-byte-sniffs when MIME is wrong/missing.
+	extracted, _ := extractTextByMIME(targetFile.MimeType, body)
+	if len(extracted) > MaxExtractedTextBytes {
+		extracted = extracted[:MaxExtractedTextBytes] + fmt.Sprintf(
+			"\n\n[truncated: returned %d of %d chars; ask the user for a smaller section or use download_resource in stdio mode for the full file]",
+			MaxExtractedTextBytes, len(extracted))
+	}
+	// If no extraction was possible, the raw bytes will be returned as a blob
+	// — gate THAT on the (smaller) MaxInlineBlobBytes.
+	if extracted == "" && int64(len(body)) > MaxInlineBlobBytes {
+		return nil, fmt.Errorf("binary file %q is %.1f MB and no text extractor is available; exceeds %d MB blob inline limit. Use download_resource (local stdio mode) for the full file",
+			targetFile.Filename, float64(len(body))/1024/1024, MaxInlineBlobBytes/(1024*1024))
 	}
 
 	folderHint := ""
