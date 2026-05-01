@@ -37,7 +37,7 @@ func (s *RESTServer) Run(ctx context.Context) error {
 		Handler: s.mux,
 	}
 	log.Printf("REST API listening on http://localhost:%d", s.port)
-	log.Println("OpenAPI docs: http://localhost:%d/api/docs", s.port)
+	log.Printf("OpenAPI docs: http://localhost:%d/api/docs", s.port)
 	return httpServer.ListenAndServe()
 }
 

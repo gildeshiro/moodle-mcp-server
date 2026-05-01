@@ -430,7 +430,7 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 		func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			limit := intArg(req, "limit")
 			unreadOnly := true
-			if v, ok := req.Params.Arguments["unread_only"]; ok {
+			if v, ok := req.GetArguments()["unread_only"]; ok {
 				if b, ok := v.(bool); ok {
 					unreadOnly = b
 				}
@@ -448,7 +448,7 @@ func registerTools(s *mcpserver.MCPServer, client *api.Client) {
 
 // intArg extracts an integer from request arguments (JSON numbers are float64).
 func intArg(req mcp.CallToolRequest, key string) int {
-	if v, ok := req.Params.Arguments[key]; ok {
+	if v, ok := req.GetArguments()[key]; ok {
 		switch n := v.(type) {
 		case float64:
 			return int(n)
